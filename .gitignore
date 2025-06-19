@@ -2,5 +2,8 @@
 /export
 /mirror
 
+# Environment variables
+.env
+
 # Idea IDEs
 .idea/

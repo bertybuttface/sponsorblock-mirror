@@ -1,7 +1,8 @@
 use serde::Serialize;
 use sqlx::FromRow;
+use utoipa::ToSchema;
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize, FromRow, ToSchema)]
 pub struct SponsorTime {
     #[serde(rename = "videoID")]
     #[sqlx(rename = "videoID")]

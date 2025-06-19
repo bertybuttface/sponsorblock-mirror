@@ -1,21 +1,26 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::sleep;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use actix_cors::Cors;
 use actix_web::{web, App, HttpServer, middleware::Logger};
+use actix_web_prom::PrometheusMetricsBuilder;
 use once_cell::sync::Lazy;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 use tokio::time::interval;
 use tracing::{info, debug, error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 use structs::{Segment, Sponsor};
 
-use crate::routes::{fake_is_user_vip, fake_user_info, skip_segments, skip_segments_by_id};
+use crate::routes::{fake_is_user_vip, fake_user_info, skip_segments, skip_segments_by_id, health_check, ApiDoc};
+use crate::config::Config;
 
+mod config;
 mod models;
 mod routes;
 mod structs;
@@ -36,23 +41,23 @@ async fn main() -> std::io::Result<()> {
     // Load .env file if it exists
     dotenvy::dotenv().ok();
 
+    // Load configuration
+    let config = Config::from_env().expect("Failed to load configuration");
+    
     // Initialize tracing
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "sponsorblock_mirror=debug,actix_web=info".into()),
+                .unwrap_or_else(|_| config.log_level.clone().into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
-
-    // Get database URL
-    let database_url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL environment variable must be set");
     
-    debug!("Database connection string: {}", database_url);
+    debug!("Database connection string: {}", config.database_url);
+    debug!("Server will bind to: {}", config.server_bind_address());
 
     // Create database connection pool
-    let pool = PgPool::connect(&database_url)
+    let pool = PgPool::connect(&config.database_url)
         .await
         .expect("Failed to create database pool");
 
@@ -61,11 +66,18 @@ async fn main() -> std::io::Result<()> {
 
     // Start background task
     let pool_clone = pool.clone();
+    let config_clone = config.clone();
     tokio::spawn(async move {
-        background_database_task(pool_clone).await;
+        background_database_task(pool_clone, config_clone).await;
     });
 
-    info!("Starting server on 0.0.0.0:8001");
+    info!("Starting server on {}", config.server_bind_address());
+
+    // Create Prometheus metrics
+    let prometheus = PrometheusMetricsBuilder::new(&config.metrics_namespace)
+        .endpoint("/metrics")
+        .build()
+        .unwrap();
 
     HttpServer::new(move || {
         let cors = Cors::default()
@@ -76,21 +88,27 @@ async fn main() -> std::io::Result<()> {
 
         App::new()
             .app_data(web::Data::new(pool.clone()))
+            .wrap(prometheus.clone())
             .wrap(cors)
             .wrap(Logger::default())
+            .service(
+                SwaggerUi::new("/swagger-ui/{_:.*}")
+                    .url("/api-docs/openapi.json", ApiDoc::openapi())
+            )
+            .route("/health", web::get().to(health_check))
             .route("/api/skipSegments/{hash}", web::get().to(skip_segments))
             .route("/api/skipSegments", web::get().to(skip_segments_by_id))
             .route("/api/isUserVIP", web::get().to(fake_is_user_vip))
             .route("/api/userInfo", web::get().to(fake_user_info))
     })
-    .bind("0.0.0.0:8001")?
+    .bind(config.server_bind_address())?
     .run()
     .await
 }
 
-async fn background_database_task(pool: PgPool) {
-    let mut interval = interval(Duration::from_secs(30));
-    let path = Path::new("mirror/sponsorTimes.csv");
+async fn background_database_task(pool: PgPool, config: Config) {
+    let mut interval = interval(config.check_interval());
+    let path = Path::new(&config.csv_path);
 
     loop {
         interval.tick().await;
@@ -98,7 +116,7 @@ async fn background_database_task(pool: PgPool) {
         let locked_last_updated_time = &mut *lock_guard;
 
         // see if file exists
-        if path.exists() && (*locked_last_updated_time == UNIX_EPOCH || locked_last_updated_time.elapsed().unwrap_or_default().as_secs() > 60) {
+        if path.exists() && (*locked_last_updated_time == UNIX_EPOCH || locked_last_updated_time.elapsed().unwrap_or_default() > config.file_check_interval()) {
 
             // Check last modified time
             let last_modified = path.metadata().unwrap().modified().unwrap();
@@ -126,7 +144,7 @@ async fn background_database_task(pool: PgPool) {
                     .execute(&mut *transaction)
                     .await;
                 
-                let copy_data = sqlx::query(r#"COPY "sponsorTimesTemp" FROM '/mirror/sponsorTimes.csv' DELIMITER ',' CSV HEADER"#)
+                let copy_data = sqlx::query(&format!(r#"COPY "sponsorTimesTemp" FROM '{}' DELIMITER ',' CSV HEADER"#, path.display()))
                     .execute(&mut *transaction)
                     .await;
                 
@@ -164,7 +182,7 @@ async fn background_database_task(pool: PgPool) {
                 }
             }
 
-            sleep(Duration::from_secs(60));
+            sleep(config.file_check_interval());
         }
     }
 }

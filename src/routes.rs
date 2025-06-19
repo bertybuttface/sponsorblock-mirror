@@ -3,9 +3,41 @@ use std::collections::HashMap;
 use actix_web::{web, HttpResponse, Result};
 use lazy_static::lazy_static;
 use sqlx::PgPool;
+use utoipa::OpenApi;
 
 use crate::{Segment, Sponsor};
 use crate::models::SponsorTime;
+use crate::structs::{HealthResponse, HealthChecks, HealthCheck};
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        skip_segments,
+        skip_segments_by_id,
+        fake_is_user_vip,
+        fake_user_info,
+        health_check,
+        metrics
+    ),
+    components(
+        schemas(Sponsor, Segment, SponsorTime, HealthResponse, HealthChecks, HealthCheck)
+    ),
+    tags(
+        (name = "Skip Segments", description = "SponsorBlock segment retrieval endpoints"),
+        (name = "User Info", description = "User information endpoints (mocked for ReVanced compatibility)"),
+        (name = "Health", description = "Service health monitoring endpoints"),
+        (name = "Metrics", description = "Prometheus metrics endpoints")
+    ),
+    info(
+        title = "SponsorBlock Mirror API",
+        description = "A mirror of the SponsorBlock API for retrieving video sponsor segments",
+        version = "1.0.0",
+        contact(
+            name = "API Support"
+        )
+    )
+)]
+pub struct ApiDoc;
 
 // init regexes to match hash/hex or video ID
 lazy_static! {
@@ -22,6 +54,21 @@ enum VideoName {
 }
 
 
+#[utoipa::path(
+    get,
+    path = "/api/skipSegments/{hash}",
+    params(
+        ("hash" = String, Path, description = "4-character hex prefix of hashed video ID")
+    ),
+    params(
+        ("categories" = Option<String>, Query, description = "JSON array of sponsor categories to filter by")
+    ),
+    responses(
+        (status = 200, description = "List of sponsors with segments", body = [Sponsor]),
+        (status = 400, description = "Invalid hash format")
+    ),
+    tag = "Skip Segments"
+)]
 pub async fn skip_segments(
     path: web::Path<String>,
     query: web::Query<HashMap<String, String>>,
@@ -29,7 +76,6 @@ pub async fn skip_segments(
 ) -> Result<HttpResponse> {
     let hash = path.into_inner().to_lowercase();
     let categories = query.get("categories");
-    let hash = hash.to_lowercase();
 
     // Check if hash matches hex regex
     if !HASH_RE.is_match(&hash) {
@@ -57,6 +103,19 @@ pub async fn skip_segments(
     Ok(HttpResponse::Ok().json(&sponsors))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/skipSegments",
+    params(
+        ("videoID" = String, Query, description = "YouTube video ID (6-11 characters)"),
+        ("categories" = Option<String>, Query, description = "JSON array of sponsor categories to filter by")
+    ),
+    responses(
+        (status = 200, description = "List of segments for the video", body = [Segment]),
+        (status = 400, description = "Invalid or missing videoID")
+    ),
+    tag = "Skip Segments"
+)]
 pub async fn skip_segments_by_id(
     query: web::Query<HashMap<String, String>>,
     db: web::Data<PgPool>,
@@ -261,6 +320,14 @@ fn build_segment(sponsor_time: &SponsorTime) -> Segment {
 // don't *need* to do this to support ReVanced, but it gets rid of the
 // perpetual "Loading..." in the settings.
 
+#[utoipa::path(
+    get,
+    path = "/api/isUserVIP",
+    responses(
+        (status = 200, description = "User VIP status", body = serde_json::Value)
+    ),
+    tag = "User Info"
+)]
 pub async fn fake_is_user_vip() -> Result<HttpResponse> {
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "hashedUserID": "",
@@ -268,6 +335,14 @@ pub async fn fake_is_user_vip() -> Result<HttpResponse> {
     })))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/userInfo",
+    responses(
+        (status = 200, description = "User information and statistics", body = serde_json::Value)
+    ),
+    tag = "User Info"
+)]
 pub async fn fake_user_info() -> Result<HttpResponse> {
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "userID": "",
@@ -276,4 +351,71 @@ pub async fn fake_user_info() -> Result<HttpResponse> {
         "segmentCount": 0,
         "viewCount": 0
     })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses(
+        (status = 200, description = "Service is healthy", body = HealthResponse),
+        (status = 503, description = "Service is unhealthy", body = HealthResponse)
+    ),
+    tag = "Health"
+)]
+pub async fn health_check(db: web::Data<PgPool>) -> Result<HttpResponse> {
+    use std::time::Instant;
+    
+    let start = Instant::now();
+    
+    // Check database connectivity
+    let db_check = match sqlx::query("SELECT 1").fetch_one(db.as_ref()).await {
+        Ok(_) => HealthCheck {
+            status: "healthy".to_string(),
+            message: Some("Database connection successful".to_string()),
+            response_time_ms: Some(start.elapsed().as_millis() as u64),
+        },
+        Err(e) => HealthCheck {
+            status: "unhealthy".to_string(),
+            message: Some(format!("Database connection failed: {}", e)),
+            response_time_ms: Some(start.elapsed().as_millis() as u64),
+        },
+    };
+    
+    let overall_status = if db_check.status == "healthy" {
+        "healthy"
+    } else {
+        "unhealthy"
+    };
+    
+    let health_response = HealthResponse {
+        status: overall_status.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        checks: HealthChecks {
+            database: db_check,
+        },
+    };
+    
+    let status_code = if overall_status == "healthy" {
+        actix_web::http::StatusCode::OK
+    } else {
+        actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+    
+    Ok(HttpResponse::build(status_code).json(&health_response))
+}
+
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    responses(
+        (status = 200, description = "Prometheus metrics in text format", body = String)
+    ),
+    tag = "Metrics"
+)]
+pub async fn metrics() -> Result<HttpResponse> {
+    // This endpoint is handled by actix-web-prom middleware
+    // This function is just for OpenAPI documentation
+    Ok(HttpResponse::Ok()
+        .content_type("text/plain; version=0.0.4; charset=utf-8")
+        .body("# Metrics handled by actix-web-prom middleware"))
 }
