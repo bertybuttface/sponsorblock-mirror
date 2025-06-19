@@ -1,23 +1,11 @@
 use std::collections::HashMap;
 
-use diesel::prelude::*;
+use actix_web::{web, HttpResponse, Result};
 use lazy_static::lazy_static;
-use rocket::response::content;
+use sqlx::PgPool;
 
-use crate::{Db, Segment, Sponsor};
+use crate::{Segment, Sponsor};
 use crate::models::SponsorTime;
-// We *must* use "videoID" as an argument name to get Rocket to let us access
-// the query parameter by that name, but if videoID is already used we
-// can't do that.
-use crate::schema::sponsorTimes::dsl::{
-    category,
-    hashedVideoID,
-    hidden,
-    shadowHidden,
-    sponsorTimes,
-    videoID as column_videoID,
-    votes,
-};
 
 // init regexes to match hash/hex or video ID
 lazy_static! {
@@ -34,27 +22,28 @@ enum VideoName {
 }
 
 
-#[get("/api/skipSegments/<hash>?<categories>")]
 pub async fn skip_segments(
-    hash: String,
-    categories: Option<&str>,
-    db: Db,
-) -> content::RawJson<String> {
+    path: web::Path<String>,
+    query: web::Query<HashMap<String, String>>,
+    db: web::Data<PgPool>,
+) -> Result<HttpResponse> {
+    let hash = path.into_inner().to_lowercase();
+    let categories = query.get("categories");
     let hash = hash.to_lowercase();
 
     // Check if hash matches hex regex
     if !HASH_RE.is_match(&hash) {
-        return content::RawJson("Hash prefix does not match format requirements.".to_string());
+        return Ok(HttpResponse::BadRequest().body("Hash prefix does not match format requirements."));
     }
 
-    let sponsors = find_skip_segments(VideoName::ByHashPrefix(hash.clone()), categories, db).await;
+    let sponsors = find_skip_segments(VideoName::ByHashPrefix(hash.clone()), categories.map(|s| s.as_str()), &db).await;
 
     if sponsors.is_empty() {
         // Fall back to central Sponsorblock server
         let resp = reqwest::get(format!(
             "https://sponsor.ajay.app/api/skipSegments/{}?categories={}",
             hash,
-            categories.unwrap_or("[\"sponsor\"]"),
+            categories.map(|s| s.as_str()).unwrap_or("[\"sponsor\"]"),
         ))
             .await
             .unwrap()
@@ -62,33 +51,35 @@ pub async fn skip_segments(
             .await
             .unwrap();
 
-        return content::RawJson(resp);
+        return Ok(HttpResponse::Ok().content_type("application/json").body(resp));
     }
 
-    content::RawJson(serde_json::to_string(&sponsors).unwrap())
+    Ok(HttpResponse::Ok().json(&sponsors))
 }
 
-#[get("/api/skipSegments?<videoID>&<categories>")]
 pub async fn skip_segments_by_id(
-    #[allow(non_snake_case)]
-    videoID: String,
-    categories: Option<&str>,
-    db: Db,
-) -> content::RawJson<String> {
+    query: web::Query<HashMap<String, String>>,
+    db: web::Data<PgPool>,
+) -> Result<HttpResponse> {
+    let video_id = match query.get("videoID") {
+        Some(id) => id,
+        None => return Ok(HttpResponse::BadRequest().body("videoID parameter is required")),
+    };
+    let categories = query.get("categories");
 
     // Check if ID matches ID regex
-    if !ID_RE.is_match(&videoID) {
-        return content::RawJson("videoID does not match format requirements".to_string());
+    if !ID_RE.is_match(video_id) {
+        return Ok(HttpResponse::BadRequest().body("videoID does not match format requirements"));
     }
 
-    let sponsors = find_skip_segments(VideoName::ByID(videoID.clone()), categories, db).await;
+    let sponsors = find_skip_segments(VideoName::ByID(video_id.clone()), categories.map(|s| s.as_str()), &db).await;
 
     if sponsors.is_empty() {
         // Fall back to central Sponsorblock server
         let resp = reqwest::get(format!(
             "https://sponsor.ajay.app/api/skipSegments?videoID={}&categories={}",
-            videoID,
-            categories.unwrap_or("[\"sponsor\"]"),
+            video_id,
+            categories.map(|s| s.as_str()).unwrap_or("[\"sponsor\"]"),
         ))
             .await
             .unwrap()
@@ -96,18 +87,18 @@ pub async fn skip_segments_by_id(
             .await
             .unwrap();
 
-        return content::RawJson(resp);
+        return Ok(HttpResponse::Ok().content_type("application/json").body(resp));
     }
 
     // Doing a lookup by video ID should return only one Sponsor object with
     // one list of segments. We need to return just the list of segments.
-    content::RawJson(serde_json::to_string(&sponsors[0].segments).unwrap())
+    Ok(HttpResponse::Ok().json(&sponsors[0].segments))
 }
 
 async fn find_skip_segments(
     name: VideoName,
     categories: Option<&str>,
-    db: Db,
+    db: &PgPool,
 ) -> Vec<Sponsor> {
     let cat: Vec<String> = serde_json::from_str(categories.unwrap_or("[\"sponsor\"]")).unwrap();
 
@@ -115,28 +106,38 @@ async fn find_skip_segments(
         return Vec::new();
     }
 
-    let results: Vec<SponsorTime> = db.run(move |conn| {
-        let base_filter = sponsorTimes
-            .filter(shadowHidden.eq(0))
-            .filter(hidden.eq(0))
-            .filter(votes.ge(0))
-            .filter(category.eq_any(cat)); // We know cat isn't empty at this point
-
-        match name {
-            VideoName::ByHashPrefix(hash_prefix) => {
-                base_filter
-                    .filter(hashedVideoID.like(format!("{}%", hash_prefix)))
-                    .get_results::<SponsorTime>(conn)
-                    .expect("Failed to query sponsor times")
-            }
-            VideoName::ByID(video_id) => {
-                base_filter
-                    .filter(column_videoID.eq(video_id))
-                    .get_results::<SponsorTime>(conn)
-                    .expect("Failed to query sponsor times")
-            }
+    let results: Vec<SponsorTime> = match name {
+        VideoName::ByHashPrefix(hash_prefix) => {
+            sqlx::query_as::<_, SponsorTime>(
+                r#"SELECT * FROM "sponsorTimes" 
+                   WHERE "shadowHidden" = 0 
+                   AND "hidden" = 0 
+                   AND "votes" >= 0 
+                   AND "category" = ANY($1)
+                   AND "hashedVideoID" LIKE $2"#,
+            )
+            .bind(&cat)
+            .bind(format!("{}%", hash_prefix))
+            .fetch_all(db)
+            .await
+            .expect("Failed to query sponsor times")
         }
-    }).await;
+        VideoName::ByID(video_id) => {
+            sqlx::query_as::<_, SponsorTime>(
+                r#"SELECT * FROM "sponsorTimes" 
+                   WHERE "shadowHidden" = 0 
+                   AND "hidden" = 0 
+                   AND "votes" >= 0 
+                   AND "category" = ANY($1)
+                   AND "videoID" = $2"#,
+            )
+            .bind(&cat)
+            .bind(video_id)
+            .fetch_all(db)
+            .await
+            .expect("Failed to query sponsor times")
+        }
+    };
 
     // Create map of Sponsors - Hash, Sponsor
     let mut sponsors: HashMap<String, Sponsor> = HashMap::new();
@@ -260,14 +261,19 @@ fn build_segment(sponsor_time: &SponsorTime) -> Segment {
 // don't *need* to do this to support ReVanced, but it gets rid of the
 // perpetual "Loading..." in the settings.
 
-// This would take a userID
-#[get("/api/isUserVIP")]
-pub async fn fake_is_user_vip() -> content::RawJson<String> {
-    content::RawJson("{\"hashedUserID\": \"\", \"vip\": false}".to_string())
+pub async fn fake_is_user_vip() -> Result<HttpResponse> {
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "hashedUserID": "",
+        "vip": false
+    })))
 }
 
-// This would take a userID and an optional list values
-#[get("/api/userInfo")]
-pub async fn fake_user_info() -> content::RawJson<String> {
-    content::RawJson("{\"userID\": \"\", \"userName\": \"\", \"minutesSaved\": 0, \"segmentCount\": 0, \"viewCount\": 0}".to_string())
+pub async fn fake_user_info() -> Result<HttpResponse> {
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "userID": "",
+        "userName": "",
+        "minutesSaved": 0,
+        "segmentCount": 0,
+        "viewCount": 0
+    })))
 }

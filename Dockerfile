@@ -26,8 +26,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
 WORKDIR /app/
 
 COPY --from=BUILD /app/sponsorblock-mirror .
-COPY --from=BUILD /app/Rocket.toml .
 
-EXPOSE 8000
+EXPOSE 8001
 
 CMD ["/app/sponsorblock-mirror"]

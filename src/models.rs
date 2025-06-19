@@ -1,52 +1,50 @@
-use diesel::prelude::*;
 use serde::Serialize;
-use crate::schema::*;
+use sqlx::FromRow;
 
-#[derive(Debug, Serialize, Queryable, Insertable)]
-#[diesel(table_name = sponsorTimes)]
+#[derive(Debug, Serialize, FromRow)]
 pub struct SponsorTime {
     #[serde(rename = "videoID")]
-    #[diesel(column_name = videoID)]
+    #[sqlx(rename = "videoID")]
     pub video_id: String,
     #[serde(rename = "startTime")]
-    #[diesel(column_name = startTime)]
+    #[sqlx(rename = "startTime")]
     pub start_time: f32,
     #[serde(rename = "endTime")]
-    #[diesel(column_name = endTime)]
+    #[sqlx(rename = "endTime")]
     pub end_time: f32,
     pub votes: i32,
     pub locked: i32,
     #[serde(rename = "incorrectVotes")]
-    #[diesel(column_name = incorrectVotes)]
+    #[sqlx(rename = "incorrectVotes")]
     pub incorrect_votes: i32,
     #[serde(rename = "UUID")]
-    #[diesel(column_name = UUID)]
+    #[sqlx(rename = "UUID")]
     pub uuid: String,
     #[serde(rename = "userID")]
-    #[diesel(column_name = userID)]
+    #[sqlx(rename = "userID")]
     pub user_id: String,
     #[serde(rename = "timeSubmitted")]
-    #[diesel(column_name = timeSubmitted)]
+    #[sqlx(rename = "timeSubmitted")]
     pub time_submitted: i64,
     pub views: i32,
     pub category: String,
     #[serde(rename = "actionType")]
-    #[diesel(column_name = actionType)]
+    #[sqlx(rename = "actionType")]
     pub action_type: String,
     pub service: String,
     #[serde(rename = "videoDuration")]
-    #[diesel(column_name = videoDuration)]
+    #[sqlx(rename = "videoDuration")]
     pub video_duration: f32,
     pub hidden: i32,
     pub reputation: f32,
     #[serde(rename = "shadowHidden")]
-    #[diesel(column_name = shadowHidden)]
+    #[sqlx(rename = "shadowHidden")]
     pub shadow_hidden: i32,
     #[serde(rename = "hashedVideoID")]
-    #[diesel(column_name = hashedVideoID)]
+    #[sqlx(rename = "hashedVideoID")]
     pub hashed_video_id: String,
     #[serde(rename = "userAgent")]
-    #[diesel(column_name = userAgent)]
+    #[sqlx(rename = "userAgent")]
     pub user_agent: String,
     pub description: String,
 }
